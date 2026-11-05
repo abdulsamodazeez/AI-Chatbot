@@ -1,112 +1,112 @@
-import streamlit as st
-from openai import OpenAI
-from PyPDF2 import PdfFileReader
-import os
+import hashlib
 import io
 
-API_KEY_ = os.environ.get("API_KEY_")
+import openai
+import streamlit as st
+from dotenv import load_dotenv
 
-# Initialize the OpenAI client
-openai = OpenAI(
-    api_key= API_KEY_,
-    base_url="https://api.deepinfra.com/v1/openai"
-)
+from chatbot.chunking import chunk_pages
+from chatbot.config import load_settings
+from chatbot.index import SearchResult, VectorIndex
+from chatbot.llm import build_messages, make_client, make_embedder, stream_answer
+from chatbot.pdf import read_pdf
 
-# Function to get response from OpenAI
-def get_openai_response(message_history):
-    chat_completion = openai.chat.completions.create(
-        model="mistralai/Mixtral-8x7B-Instruct-v0.1",
-        messages=message_history
-    )
-    return chat_completion.choices[0].message.content
+load_dotenv()
+settings = load_settings()
 
-# Function to send the message and get response
-def send_message():
-    user_message = {"role": "user", "content": st.session_state.user_input}
-    st.session_state.history.append(user_message)
+st.set_page_config(page_title="Document Assistant", layout="centered")
+st.title("Document Assistant")
+st.caption("Ask questions about your PDFs. Answers come only from your documents, with page citations.")
 
-    # Get response from OpenAI
-    openai_response = get_openai_response(st.session_state.history)
-    st.session_state.history.append({"role": "assistant", "content": openai_response})
-    st.session_state.user_input = ""
+if not settings.api_key:
+    st.error("Set OPENAI_API_KEY to start. See .env.example for the available settings.")
+    st.stop()
 
-# Function to extract text from uploaded PDF
-def extract_text_from_pdf(pdf_file):
-    reader = PdfFileReader(pdf_file)
-    text = ""
-    for page in range(len(reader.pages)):
-        text += reader.pages[page].extract_text()
-    return text
 
-# Store conversation history
-if 'history' not in st.session_state:
-    st.session_state['history'] = []
-if 'user_input' not in st.session_state:
-    st.session_state['user_input'] = ""
-if 'pdf_text' not in st.session_state:
-    st.session_state['pdf_text'] = ""
+@st.cache_resource
+def get_client():
+    return make_client(settings)
 
-# Sidebar for PDF upload
-st.sidebar.header("Upload PDF")
-uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type="pdf")
 
-if uploaded_file:
-    st.session_state['pdf_text'] = extract_text_from_pdf(uploaded_file)
-    st.session_state.history.append({"role": "system", "content": "PDF content uploaded and extracted."})
+client = get_client()
+embed = make_embedder(client, settings.embedding_model)
 
-# Display conversation history
-chat_container = st.container()
 
-for message in st.session_state.history:
-    if message['role'] == "user":
-        chat_container.markdown(f"""
-        <div style='text-align: right; padding: 10px; border-radius: 10px; margin: 5px; display: flex; align-items: center;'>
-            <span style='flex: 1;'></span>
-            <span style='padding-right: 10px;'>{message['content']}</span>
-            <img src='https://img.icons8.com/color/48/000000/user-male-circle.png' width='24' style='vertical-align: middle;'> 
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        chat_container.markdown(f"""
-        <div style='text-align: left; padding: 10px; border-radius: 10px; margin: 5px; display: flex; align-items: center;'>
-            <img src='https://img.icons8.com/color/48/000000/robot-2.png' width='24' style='vertical-align: middle;'> 
-            <span style='padding-left: 10px;'>{message['content']}</span>
-        </div>
-        """, unsafe_allow_html=True)
+def build_index(files: list[tuple[str, bytes]]) -> VectorIndex:
+    pages = [page for name, data in files for page in read_pdf(io.BytesIO(data), name)]
+    chunks = chunk_pages(pages, settings.chunk_size, settings.chunk_overlap)
+    return VectorIndex.build(chunks, embed)
 
-# Input box and Send button at the bottom
-st.text_input("", key="user_input", on_change=send_message, value="", placeholder="Ask something...")
 
-# Custom CSS for styling
-st.markdown("""
-    <style>
-        .text-center {
-            text-align: center;
-        }
-        .mt-5 {
-            margin-top: 3rem;
-        }
-        .mb-4 {
-            margin-bottom: 1.5rem;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+def render_sources(sources: list[dict]) -> None:
+    if not sources:
+        return
+    with st.expander(f"Sources ({len(sources)})"):
+        for s in sources:
+            st.markdown(f"**{s['source']}, page {s['page']}** · relevance {s['score']:.2f}")
+            st.caption(s["text"])
 
-# Using the extracted PDF text in RAG
-def get_rag_response(user_query, pdf_text):
-    # Here you would implement your RAG logic
-    # For simplicity, we'll concatenate the user query with PDF text
-    augmented_input = f"{user_query}\n\nContext from PDF:\n{pdf_text[:1000]}"  # Limiting context length
-    message_history = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": augmented_input}
+
+def to_sources(results: list[SearchResult]) -> list[dict]:
+    return [
+        {"source": r.chunk.source, "page": r.chunk.page, "text": r.chunk.text, "score": r.score}
+        for r in results
     ]
-    return get_openai_response(message_history)
 
-# Example usage of RAG
-if st.session_state.user_input:
-    user_query = st.session_state.user_input
-    pdf_context = st.session_state.pdf_text
-    rag_response = get_rag_response(user_query, pdf_context)
-    st.session_state.history.append({"role": "assistant", "content": rag_response})
-    st.session_state.user_input = ""
+
+with st.sidebar:
+    st.header("Documents")
+    uploads = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+    if st.button("Clear chat", use_container_width=True):
+        st.session_state.messages = []
+
+if not uploads:
+    st.info("Upload one or more PDFs in the sidebar to begin.")
+    st.stop()
+
+files = [(f.name, f.getvalue()) for f in uploads]
+files_key = hashlib.sha256(b"".join(name.encode() + data for name, data in files)).hexdigest()
+
+if st.session_state.get("files_key") != files_key:
+    try:
+        with st.spinner("Reading and indexing your documents..."):
+            index = build_index(files)
+    except openai.OpenAIError as exc:
+        st.error(f"Could not index the documents: {exc}")
+        st.stop()
+    st.session_state.update(index=index, files_key=files_key, messages=[])
+
+index: VectorIndex = st.session_state.index
+if not index.chunks:
+    st.warning("No extractable text found. Scanned PDFs need OCR before they can be searched.")
+    st.stop()
+
+with st.sidebar:
+    st.caption(f"{len(files)} file(s) indexed · {len(index.chunks)} passages")
+
+messages: list[dict] = st.session_state.setdefault("messages", [])
+
+for message in messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        render_sources(message.get("sources", []))
+
+if question := st.chat_input("Ask about your documents"):
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    history = [{"role": m["role"], "content": m["content"]} for m in messages]
+    with st.chat_message("assistant"):
+        try:
+            results = index.search(embed([question])[0], settings.top_k)
+            answer = st.write_stream(
+                stream_answer(client, settings.chat_model, build_messages(question, results, history))
+            )
+        except openai.OpenAIError as exc:
+            st.error(f"The model request failed: {exc}")
+            st.stop()
+        sources = to_sources(results)
+        render_sources(sources)
+
+    messages.append({"role": "user", "content": question})
+    messages.append({"role": "assistant", "content": answer, "sources": sources})

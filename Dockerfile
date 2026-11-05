@@ -1,20 +1,18 @@
-# Use an official Python runtime as a parent image
-FROM python:3.8-slim
+FROM python:3.12-slim
 
-# Set the working directory in the container
-WORKDIR /usr/src/app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Copy the current directory contents into the container at /usr/src/app
-COPY . .
+WORKDIR /app
 
-# Install the necessary Python packages
-RUN pip install --no-cache-dir streamlit openai
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Make port 8501 available to the world outside this container
+COPY chatbot ./chatbot
+COPY app.py .
+
+RUN useradd --create-home appuser
+USER appuser
+
 EXPOSE 8501
-
-# Define environment variable
-ENV NAME World
-
-# Run app.py when the container launches
-CMD ["streamlit", "run", "app.py"]
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
